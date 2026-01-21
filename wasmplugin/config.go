@@ -16,6 +16,15 @@ type pluginConfiguration struct {
 	metricLabels           map[string]string
 	defaultDirectives      string
 	perAuthorityDirectives map[string]string
+
+	// ruleSetCacheServerCluster is the Envoy cluster address of the RuleSet Cache Server
+	ruleSetCacheServerCluster string
+
+	// ruleSetCacheServerInstance is the unique identifier used to fetch rules for this specific WAF instance
+	ruleSetCacheServerInstance string
+
+	// ruleSetReloadIntervalSeconds specifies how often to reload rules from the cache server
+	ruleSetReloadIntervalSeconds int
 }
 
 type DirectivesMap map[string][]string
@@ -76,6 +85,28 @@ func parsePluginConfiguration(data []byte, infoLogger func(string)) (pluginConfi
 		if _, ok := config.directivesMap[directiveName]; !ok {
 			return config, fmt.Errorf("directive map not found for authority %s: %q", authority, directiveName)
 		}
+	}
+
+	// check whether a ruleset cache server was provided to fetch rules from
+	ruleSetCacheServerCluster := jsonData.Get("cache_server_cluster")
+	if ruleSetCacheServerCluster.Exists() {
+		config.ruleSetCacheServerCluster = ruleSetCacheServerCluster.String()
+	}
+
+	// check for a unique instance identifier, otherwise default to "default"
+	ruleSetCacheServerInstance := jsonData.Get("cache_server_instance")
+	if ruleSetCacheServerInstance.Exists() {
+		config.ruleSetCacheServerInstance = ruleSetCacheServerInstance.String()
+	} else {
+		config.ruleSetCacheServerInstance = "default"
+	}
+
+	// check for a configured reload interval, otherwise default to 30 seconds
+	ruleReloadInterval := jsonData.Get("rule_reload_interval_seconds")
+	if ruleReloadInterval.Exists() {
+		config.ruleSetReloadIntervalSeconds = int(ruleReloadInterval.Int())
+	} else {
+		config.ruleSetReloadIntervalSeconds = 30
 	}
 
 	if len(config.directivesMap) == 0 {

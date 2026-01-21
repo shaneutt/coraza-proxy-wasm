@@ -6,6 +6,7 @@ package wasmplugin
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -81,6 +82,18 @@ type corazaPlugin struct {
 	perAuthorityWAFs wafMap
 	metricLabelsKV   []string
 	metrics          *wafMetrics
+
+	// ruleSetCacheServerCluster is the Envoy cluster address of the RuleSet Cache Server
+	ruleSetCacheServerCluster string
+
+	// ruleSetCacheServerInstance is the unique identifier used to fetch rules for this specific WAF instance
+	ruleSetCacheServerInstance string
+
+	// ruleSetReloadEnabled indicates whether periodic rule reloading is enabled
+	ruleSetReloadEnabled bool
+
+	// currentRuleSetUUID is the UUID of the currently loaded ruleset configuration
+	currentRuleSetUUID string
 }
 
 func (ctx *corazaPlugin) OnPluginStart(pluginConfigurationSize int) types.OnPluginStartStatus {
@@ -93,6 +106,35 @@ func (ctx *corazaPlugin) OnPluginStart(pluginConfigurationSize int) types.OnPlug
 	if err != nil {
 		proxywasm.LogCriticalf("Failed to parse plugin configuration: %v", err)
 		return types.OnPluginStartStatusFailed
+	}
+
+	// If a ruleset cache server was supplied, pull the rules and apply them.
+	// Optionally enable periodic reloading of rules from the cache server.
+	ctx.ruleSetCacheServerCluster = config.ruleSetCacheServerCluster
+	ctx.ruleSetCacheServerInstance = config.ruleSetCacheServerInstance
+	if ctx.ruleSetCacheServerCluster != "" {
+		proxywasm.LogCriticalf("Fetching initial rules from ruleset cache server: %s, instance: %s", ctx.ruleSetCacheServerCluster, ctx.ruleSetCacheServerInstance)
+
+		ctx.fetchRulesFromCache()
+
+		ctx.perAuthorityWAFs = newWAFMap(0)
+		for k, v := range config.metricLabels {
+			ctx.metricLabelsKV = append(ctx.metricLabelsKV, k, v)
+		}
+		ctx.metrics = NewWAFMetrics()
+
+		if config.ruleSetReloadIntervalSeconds > 0 {
+			ctx.ruleSetReloadEnabled = true
+			intervalMs := uint32(config.ruleSetReloadIntervalSeconds * 1000)
+			if err := proxywasm.SetTickPeriodMilliSeconds(intervalMs); err != nil {
+				proxywasm.LogCriticalf("Failed to set tick period for rule reloading: %v", err)
+				return types.OnPluginStartStatusFailed
+			}
+
+			proxywasm.LogCriticalf("Enabled periodic rule reloading every %d seconds", config.ruleSetReloadIntervalSeconds)
+		}
+
+		return types.OnPluginStartStatusOK
 	}
 
 	// directivesAuthoritesMap is a map of directives name to the list of
@@ -829,4 +871,186 @@ func parseServerName(logger debuglog.Logger, authority string) string {
 		host = authority
 	}
 	return host
+}
+
+// OnTick is called periodically if ruleSetReloadEnabled is true
+func (ctx *corazaPlugin) OnTick() {
+	if !ctx.ruleSetReloadEnabled {
+		return
+	}
+
+	proxywasm.LogInfo("Checking for ruleset updates")
+	ctx.checkLatestRuleSet()
+}
+
+// checkLatestRuleSet checks if a new ruleset version is available
+func (ctx *corazaPlugin) checkLatestRuleSet() {
+	path := fmt.Sprintf("/rules/%s/latest", ctx.ruleSetCacheServerInstance)
+
+	// extract hostname from envoy cluster (format: outbound|80||hostname)
+	authority := ctx.ruleSetCacheServerCluster
+	if idx := strings.LastIndex(authority, "||"); idx != -1 {
+		authority = authority[idx+2:]
+	}
+
+	_, err := proxywasm.DispatchHttpCall(
+		ctx.ruleSetCacheServerCluster,
+		[][2]string{
+			{":method", "GET"},
+			{":path", path},
+			{":authority", authority},
+		},
+		nil,
+		[][2]string{},
+		5000,
+		ctx.onLatestRuleSetResponse,
+	)
+
+	if err != nil {
+		proxywasm.LogCriticalf("Failed to dispatch HTTP call to check latest ruleset: %v", err)
+		return
+	}
+}
+
+// fetchRulesFromCache dispatches an HTTP call to the RuleSet Cache Server to pull configuration
+func (ctx *corazaPlugin) fetchRulesFromCache() {
+	path := fmt.Sprintf("/rules/%s", ctx.ruleSetCacheServerInstance)
+
+	// extract hostname from envoy cluster (format: outbound|80||hostname)
+	authority := ctx.ruleSetCacheServerCluster
+	if idx := strings.LastIndex(authority, "||"); idx != -1 {
+		authority = authority[idx+2:]
+	}
+
+	_, err := proxywasm.DispatchHttpCall(
+		ctx.ruleSetCacheServerCluster,
+		[][2]string{
+			{":method", "GET"},
+			{":path", path},
+			{":authority", authority},
+		},
+		nil,
+		[][2]string{},
+		5000,
+		ctx.onRuleSetCacheServerResponse,
+	)
+
+	if err != nil {
+		proxywasm.LogCriticalf("Failed to dispatch HTTP call to ruleset cache server: %v", err)
+		return
+	}
+
+	proxywasm.LogInfo("Dispatched HTTP call to ruleset cache server")
+}
+
+// onLatestRuleSetResponse handles the response from the /latest endpoint
+func (ctx *corazaPlugin) onLatestRuleSetResponse(numHeaders, bodySize, numTrailers int) {
+	headers, err := proxywasm.GetHttpCallResponseHeaders()
+	if err != nil {
+		proxywasm.LogCriticalf("Failed to get response headers from latest check: %v", err)
+		return
+	}
+
+	var statusCode string
+	for _, header := range headers {
+		if header[0] == ":status" {
+			statusCode = header[1]
+			break
+		}
+	}
+
+	if statusCode != "200" {
+		proxywasm.LogCriticalf("Latest cache check returned non-200 status: %s", statusCode)
+		return
+	}
+
+	body, err := proxywasm.GetHttpCallResponseBody(0, bodySize)
+	if err != nil {
+		proxywasm.LogCriticalf("Failed to get response body from latest check: %v", err)
+		return
+	}
+
+	var latestResp struct {
+		UUID      string `json:"uuid"`
+		Timestamp string `json:"timestamp"`
+	}
+
+	if err := json.Unmarshal(body, &latestResp); err != nil {
+		proxywasm.LogCriticalf("Failed to parse latest response JSON: %v", err)
+		return
+	}
+
+	if latestResp.UUID != ctx.currentRuleSetUUID {
+		proxywasm.LogInfof("New ruleset version detected (old: %s, new: %s), fetching updated rules", ctx.currentRuleSetUUID, latestResp.UUID)
+		ctx.fetchRulesFromCache()
+	} else {
+		proxywasm.LogInfo("Ruleset is up to date, no fetch needed")
+	}
+}
+
+// onRuleSetCacheServerResponse is the callback for the HTTP call to the RuleSet Cache Server
+func (ctx *corazaPlugin) onRuleSetCacheServerResponse(numHeaders, bodySize, numTrailers int) {
+	headers, err := proxywasm.GetHttpCallResponseHeaders()
+	if err != nil {
+		proxywasm.LogCriticalf("Failed to get response headers from the ruleset cache server: %v", err)
+		return
+	}
+
+	var statusCode string
+	for _, header := range headers {
+		if header[0] == ":status" {
+			statusCode = header[1]
+			break
+		}
+	}
+
+	if statusCode != "200" {
+		proxywasm.LogCriticalf("Ruleset cache server returned non-200 status: %s", statusCode)
+		return
+	}
+
+	body, err := proxywasm.GetHttpCallResponseBody(0, bodySize)
+	if err != nil {
+		proxywasm.LogCriticalf("Failed to get response body from the ruleset cache server: %v", err)
+		return
+	}
+
+	if len(body) == 0 {
+		proxywasm.LogCriticalf("Ruleset cache server returned empty response for instance: %s", ctx.ruleSetCacheServerInstance)
+		return
+	}
+
+	var rulesResp struct {
+		UUID      string `json:"uuid"`
+		Timestamp string `json:"timestamp"`
+		Rules     string `json:"rules"`
+	}
+
+	if err := json.Unmarshal(body, &rulesResp); err != nil {
+		proxywasm.LogCriticalf("Failed to parse rules response JSON: %v", err)
+		return
+	}
+
+	if len(rulesResp.Rules) == 0 {
+		proxywasm.LogCriticalf("Ruleset cache server returned empty rules for instance: %s", ctx.ruleSetCacheServerInstance)
+		return
+	}
+
+	proxywasm.LogInfof("Received ruleset configuration: UUID=%s, Timestamp=%s, Size=%d bytes", rulesResp.UUID, rulesResp.Timestamp, len(rulesResp.Rules))
+
+	conf := coraza.NewWAFConfig().
+		WithErrorCallback(logError).
+		WithDebugLogger(debuglog.DefaultWithPrinterFactory(logPrinterFactory)).
+		WithRootFS(root)
+
+	waf, err := coraza.NewWAF(conf.WithDirectives(rulesResp.Rules))
+	if err != nil {
+		proxywasm.LogCriticalf("Failed to create WAF from cached rules: %v", err)
+		return
+	}
+
+	ctx.perAuthorityWAFs.setDefaultWAF(waf)
+	ctx.currentRuleSetUUID = rulesResp.UUID
+
+	proxywasm.LogCriticalf("Successfully loaded and activated WAF configuration (UUID: %s, %d bytes) from the ruleset cache server", rulesResp.UUID, len(rulesResp.Rules))
 }
